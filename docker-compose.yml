@@ -1,0 +1,94 @@
+# transfer-sentry's services: the bank's event broker, the fraud graph and the
+# case store. run.sh runs clink's Coordinator and Workers on the host, from a
+# local build, and they reach these through their host ports.
+#
+#   docker compose up -d --wait            # broker, topics, graph, case store
+#   docker compose down -v                 # remove everything, data included
+#
+# Host ports, for a clink run from the host (override if they collide):
+#   KAFKA_HOST_PORT      the broker                        default 29092
+#   NEO4J_HTTP_PORT      Neo4j Browser and Query API       default 7474
+#   POSTGRES_HOST_PORT   the case store                    default 25432
+
+services:
+  # One KRaft node. Transactions need the transaction-state topic, so its
+  # replication factor and minimum ISR are 1 here. Topics are created by
+  # kafka-init, never on first use, so a misspelt topic fails loudly.
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,HOST://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:${KAFKA_HOST_PORT:-29092}
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "${KAFKA_HOST_PORT:-29092}:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 10s
+
+  # The topics, one partition each, so each stream keeps the order it was
+  # produced in:
+  #   customers, accounts, transactions   what the bank's systems emit
+  #   committed-customers,                each onboarding and transaction,
+  #   committed-transactions              announced once the graph holds it
+  #   alerts                              what the detectors found
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        for t in customers accounts transactions committed-customers committed-transactions alerts; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+            --topic "$$t" --partitions 1 --replication-factor 1
+        done
+    restart: "no"
+
+  # The build clink's Neo4j connector is tested against, pinned by digest.
+  # Community, single instance. The password is this project's own.
+  neo4j:
+    image: neo4j:2026.09.0-community@sha256:d6269a020149934597c8c3df926d080a612796dbbb48861ca9d5b1109cabf0d8
+    environment:
+      NEO4J_AUTH: neo4j/transfer-sentry-pw
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 128m
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:7474/ || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+      start_period: 5s
+
+  # The case store. max_prepared_transactions > 0 is what PREPARE
+  # TRANSACTION needs, and clink's exactly-once PostgreSQL sink is built on it.
+  postgres:
+    image: postgres:16
+    command: postgres -c max_prepared_transactions=32
+    environment:
+      POSTGRES_USER: sentry
+      POSTGRES_PASSWORD: sentry
+      POSTGRES_DB: sentry
+    ports:
+      - "${POSTGRES_HOST_PORT:-25432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentry -d sentry"]
+      interval: 3s
+      timeout: 5s
+      retries: 30

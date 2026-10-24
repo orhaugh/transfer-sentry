@@ -1,0 +1,8 @@
+# Fetched at a pinned commit by scripts/fetch-demo.sh; not redistributed here.
+/data/neo4j-demo/
+# Run state, outputs and local clink installs.
+/state/
+/out/
+/.clink/
+__pycache__/
+*.pyc

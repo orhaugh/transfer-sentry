@@ -1,0 +1,9 @@
+transfer-sentry
+Copyright 2026 Ross Haugh
+
+This project builds on the graph model, sample data and queries of Neo4j's
+fraud demo, https://github.com/neo4j-product-examples/demo-fraud, licensed
+under the Apache License, Version 2.0. The demo's files are not included in
+this repository: scripts/fetch-demo.sh downloads them at a pinned commit and
+checks them against scripts/neo4j-demo.sha256. Queries adapted from the demo's
+dashboard (src/neodash/fraud-dashboard.json) are marked where they appear.
