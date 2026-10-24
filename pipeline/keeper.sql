@@ -83,7 +83,11 @@ CREATE TABLE transactions (
     amount              DOUBLE,
     type                VARCHAR,
     status              VARCHAR,
-    ts                  BIGINT
+    ts                  BIGINT,
+    -- When the feeder sent the transfer. Declared so every record matches the
+    -- table, which keeps the JSON decode on its columnar path; the graph
+    -- does not store it.
+    sent_at             BIGINT
 ) WITH (
     connector         = 'kafka',
     format            = 'json',
@@ -279,7 +283,10 @@ CREATE TABLE committed_transactions (
 EXECUTE STATEMENT SET BEGIN
   INSERT INTO customer_graph SELECT * FROM customers;
   INSERT INTO account_graph SELECT * FROM accounts;
-  INSERT INTO transaction_graph SELECT * FROM transactions;
+  INSERT INTO transaction_graph
+    SELECT transaction_id, from_account_id, from_account_number, to_account_id,
+           to_account_number, amount, type, status, ts
+    FROM transactions;
   INSERT INTO committed_customers SELECT customer_id, fraud_flag, ts FROM customers;
   INSERT INTO committed_transactions
     SELECT transaction_id, from_account_id, to_account_id, amount, ts FROM transactions;

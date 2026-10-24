@@ -19,3 +19,18 @@ CREATE TABLE IF NOT EXISTS cases (
     opened_at      timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS cases_alert_id ON cases (alert_id);
+
+-- The decision log: one row per transfer, written exactly once by
+-- pipeline/audit.sql. Again no uniqueness constraint, so a second copy would
+-- show in the run's check rather than fail the job.
+CREATE TABLE IF NOT EXISTS decision_log (
+    transaction_id text   NOT NULL,
+    decision       text   NOT NULL,
+    reasons        text,
+    evidence       text,
+    from_account   text,
+    to_account     text,
+    amount         double precision,
+    ts_ms          bigint
+);
+CREATE INDEX IF NOT EXISTS decision_log_transaction_id ON decision_log (transaction_id);

@@ -7,12 +7,14 @@
 #
 # Steps: fetch the demo and turn it into event streams; start the broker, the
 # graph and the case store; apply their schemas; start a Coordinator and two
-# Workers; submit the three jobs (pipeline/keeper.sql, detectors.sql,
-# cases.sql); send the onboardings, the accounts and the first half of the
-# transactions; send the rest one every 50 ms and, while they flow, SIGKILL a
-# Worker and start it again; resend a batch, as a producer that retried
-# would; then tools/check_run.py checks the graph, the announcements, the
-# alerts, the case store and the alert graph.
+# Workers; submit the five jobs (pipeline/keeper.sql, detectors.sql,
+# cases.sql, decisions.sql, audit.sql); send the onboardings and the accounts
+# and wait until the graph holds them; send the first half of the
+# transactions one every 20 ms, each stamped with when it was sent, and the
+# second half one every 50 ms, killing a Worker with SIGKILL while they flow
+# and starting it again; resend a batch, as a producer that retried would; then tools/check_run.py checks the graph, the
+# announcements, the alerts, the case store and the alert graph, and
+# tools/check_decisions.py every decision, the decision log and the latency.
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
@@ -103,7 +105,7 @@ start_worker 1
 worker1_pid="${last_pid}"
 start_worker 2
 pids+=("${last_pid}")
-for job in keeper detectors cases; do
+for job in keeper detectors cases decisions audit; do
   # The same SQL, reaching the services through their host ports.
   sed -e "s#kafka:9092#localhost:${KAFKA_HOST_PORT}#g" \
       -e "s#http://neo4j:7474#http://localhost:${NEO4J_HTTP_PORT}#g" \
@@ -114,32 +116,41 @@ for job in keeper detectors cases; do
     --checkpoint-dir="${STATE}/checkpoints" --checkpoint-interval-ms=2000
 done
 
-say "Sending the onboardings, the accounts and the first half of the transactions"
-scripts/feed.sh first
-
-graph_transactions() {
+graph_count() {  # <cypher returning one count>
   curl -s -u "neo4j:${NEO4J_PASSWORD}" -H 'Content-Type: application/json' \
-    -d '{"statement":"MATCH (t:Transaction) RETURN count(t)"}' \
+    -d "{\"statement\":\"$1\"}" \
     "http://localhost:${NEO4J_HTTP_PORT}/db/neo4j/query/v2" |
     python3 -I -c 'import json,sys; print(json.load(sys.stdin)["data"]["values"][0][0])' \
     2>/dev/null || echo 0
 }
 
-say "Waiting for the first half in the graph"
-for _ in $(seq 1 60); do
-  [ "$(graph_transactions)" -ge 150 ] 2>/dev/null && break
+say "Sending the onboardings and the accounts"
+scripts/feed.sh onboard
+# The decision path reads where a transfer is going from the customers and
+# accounts the graph holds, so the transfers wait until it holds all of them.
+for _ in $(seq 1 120); do
+  c="$(graph_count 'MATCH (c:Customer) WHERE c.onboardedAt IS NOT NULL RETURN count(c)')"
+  a="$(graph_count 'MATCH (a:Account) WHERE a.accountType IS NOT NULL RETURN count(a)')"
+  [ "${c}" = 74 ] && [ "${a}" = 120 ] && break
   sleep 1
 done
-echo "transactions in the graph: $(graph_transactions)"
+echo "graph: ${c} customers onboarded, ${a} accounts opened"
 
-say "Sending the rest of the transactions, one every 50 ms, and killing Worker 1 while they flow"
-PACE_MS=50 scripts/feed.sh second &
+say "Sending the first half of the transactions, one every 20 ms"
+python3 -I tools/feed_transactions.py --to 150 --pace-ms 20
+for _ in $(seq 1 60); do
+  [ "$(graph_count 'MATCH (t:Transaction) RETURN count(t)')" -ge 150 ] 2>/dev/null && break
+  sleep 1
+done
+
+say "Sending the rest, one every 50 ms, and killing Worker 1 while they flow"
+python3 -I tools/feed_transactions.py --from 150 --pace-ms 50 &
 feed_pid=$!
 for _ in $(seq 1 120); do
-  [ "$(graph_transactions)" -gt 165 ] 2>/dev/null && break
+  [ "$(graph_count 'MATCH (t:Transaction) RETURN count(t)')" -gt 165 ] 2>/dev/null && break
   sleep 0.25
 done
-echo "transactions in the graph at the kill: $(graph_transactions)"
+echo "transactions in the graph at the kill: $(graph_count 'MATCH (t:Transaction) RETURN count(t)')"
 kill -9 "${worker1_pid}"
 wait "${worker1_pid}" 2>/dev/null || true
 sleep 2
@@ -151,7 +162,12 @@ say "A producer resends a batch it had already delivered"
 scripts/feed.sh retry
 
 say "Checking every store against the demo's data"
-python3 -I tools/check_run.py --wait 180
+rc=0
+python3 -I tools/check_run.py --wait 180 || rc=1
+
+say "Checking every decision, the decision log and how long each took"
+python3 -I tools/check_decisions.py --wait 120 --steady 150 || rc=1
 echo
 echo "Neo4j Browser: http://localhost:${NEO4J_HTTP_PORT} (neo4j / ${NEO4J_PASSWORD})."
 echo "Coordinator: http://localhost:${CLINK_HTTP_PORT}. Logs: ${STATE}."
+exit "${rc}"

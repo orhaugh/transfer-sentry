@@ -4,8 +4,9 @@
 # transactions in date order. The producer runs inside the broker container,
 # so nothing beyond Docker is needed on the host.
 #
-#   scripts/feed.sh [all|first|second|retry] [events dir]
+#   scripts/feed.sh [all|onboard|first|second|retry] [events dir]
 #     all      everything (the default)
+#     onboard  the customers and the accounts, no transactions
 #     first    the customers, the accounts and the first half of the
 #              transactions
 #     second   the rest of the transactions
@@ -41,6 +42,10 @@ half=$((total / 2))
 part="$(mktemp)"
 trap 'rm -f "${part}"' EXIT
 case "${PART}" in
+  onboard)
+    produce customers "${EVENTS}/customers.jsonl"
+    produce accounts "${EVENTS}/accounts.jsonl"
+    ;;
   all | first)
     produce customers "${EVENTS}/customers.jsonl"
     produce accounts "${EVENTS}/accounts.jsonl"
@@ -60,7 +65,7 @@ case "${PART}" in
     produce transactions "${part}"
     ;;
   *)
-    echo "feed.sh: unknown part '${PART}' (all, first, second or retry)" >&2
+    echo "feed.sh: unknown part '${PART}' (all, onboard, first, second or retry)" >&2
     exit 2
     ;;
 esac

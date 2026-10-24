@@ -44,6 +44,7 @@ services:
   #   committed-customers,                each onboarding and transaction,
   #   committed-transactions              announced once the graph holds it
   #   alerts                              what the detectors found
+  #   decisions                           one decision per transfer
   kafka-init:
     image: apache/kafka:3.9.1
     depends_on:
@@ -53,9 +54,16 @@ services:
     command:
       - |
         set -e
-        for t in customers accounts transactions committed-customers committed-transactions alerts; do
+        for t in customers accounts committed-customers committed-transactions alerts; do
           /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
             --topic "$$t" --partitions 1 --replication-factor 1
+        done
+        # Stamped by the broker as each record arrives, so the decision path's
+        # latency is measured from when a transfer reached Kafka.
+        for t in transactions decisions; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+            --topic "$$t" --partitions 1 --replication-factor 1 \
+            --config message.timestamp.type=LogAppendTime
         done
     restart: "no"
 
@@ -76,11 +84,13 @@ services:
       retries: 90
       start_period: 5s
 
-  # The case store. max_prepared_transactions > 0 is what PREPARE
-  # TRANSACTION needs, and clink's exactly-once PostgreSQL sink is built on it.
+  # The case store and the decision log. max_prepared_transactions > 0 is what
+  # PREPARE TRANSACTION needs, and clink's exactly-once PostgreSQL sink is built
+  # on it. track_commit_timestamp records when each row's transaction
+  # committed, which is when a reader could first see it.
   postgres:
     image: postgres:16
-    command: postgres -c max_prepared_transactions=32
+    command: postgres -c max_prepared_transactions=32 -c track_commit_timestamp=on
     environment:
       POSTGRES_USER: sentry
       POSTGRES_PASSWORD: sentry
