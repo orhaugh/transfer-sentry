@@ -6,19 +6,22 @@
 #   CLEANUP=1 ... ./run.sh                     and remove everything at the end
 #
 # Steps: fetch the demo and turn it into event streams, with a morning of
-# minute-by-minute payments beside them (tools/payment_flows.py); start the
-# broker, the graph and the case store; apply their schemas; start a
-# Coordinator and two Workers; submit the six jobs (pipeline/keeper.sql,
-# detectors.sql, cases.sql, decisions.sql, audit.sql, inbound.sql); send the
-# onboardings and the accounts and wait until the graph holds them; send the
-# first half of the transactions and of the payments one every 20 ms, each
-# stamped with when it was sent, and the second halves one every 50 ms,
-# killing a Worker with SIGKILL while they flow and starting it again; resend
-# a batch of each, as a producer that retried would; then tools/check_run.py
-# checks the graph, the announcements, the alerts, the case store and the
-# alert graph, tools/check_decisions.py every decision, the decision log and
-# the latency, and tools/check_inbound.py every inbound decision, the inbound
-# log and the latency.
+# minute-by-minute payments beside them (tools/payment_flows.py) and four
+# weeks of transfers out of the bank's accounts (tools/transfer_history.py);
+# start the broker, the graph and the case store; apply their schemas; start a
+# Coordinator and two Workers; submit the seven jobs (pipeline/keeper.sql,
+# detectors.sql, cases.sql, decisions.sql, audit.sql, inbound.sql,
+# profiles.sql); send the onboardings and the accounts and wait until the
+# graph holds them; send the first half of the transactions, the payments and
+# the transfers one every 20 ms, each stamped with when it was sent, and the
+# second halves one every 50 ms, killing a Worker with SIGKILL while they flow
+# and starting it again; resend a batch of each, as a producer that retried
+# would; then tools/check_run.py checks the graph, the announcements, the
+# alerts, the case store and the alert graph, tools/check_decisions.py every
+# decision, the decision log and the latency, tools/check_inbound.py every
+# inbound decision, the inbound log and the latency, and
+# tools/check_profiles.py every profile decision, the profile log and the
+# latency.
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
@@ -86,6 +89,7 @@ say "The demo's data, as the event streams a bank would emit"
 scripts/fetch-demo.sh
 python3 -I tools/demo_to_events.py --out state/demo-events
 python3 -I tools/payment_flows.py --events state/demo-events
+python3 -I tools/transfer_history.py --events state/demo-events
 
 say "Starting the broker, the graph and the case store, from empty"
 docker compose down -v --remove-orphans >/dev/null 2>&1 || true
@@ -100,7 +104,7 @@ docker compose exec -T postgres psql -q -U sentry -d sentry -v ON_ERROR_STOP=1 \
   -c "DROP TABLE IF EXISTS cases" -f - <postgres/schema.sql
 echo "case store: postgres/schema.sql applied"
 
-say "Starting a Coordinator and two Workers, and submitting the six jobs"
+say "Starting a Coordinator and two Workers, and submitting the seven jobs"
 rm -rf "${STATE}" && mkdir -p "${STATE}"
 "${BIN}/clink_node" --role=coordinator --bind-host=127.0.0.1 --port=16123 \
   --http-port="${CLINK_HTTP_PORT}" --ha-dir="${STATE}/ha" >"${STATE}/coordinator.log" 2>&1 &
@@ -110,7 +114,7 @@ start_worker 1
 worker1_pid="${last_pid}"
 start_worker 2
 pids+=("${last_pid}")
-for job in keeper detectors cases decisions audit inbound; do
+for job in keeper detectors cases decisions audit inbound profiles; do
   # The same SQL, reaching the services through their host ports.
   sed -e "s#kafka:9092#localhost:${KAFKA_HOST_PORT}#g" \
       -e "s#http://neo4j:7474#http://localhost:${NEO4J_HTTP_PORT}#g" \
@@ -141,11 +145,14 @@ for _ in $(seq 1 120); do
 done
 echo "graph: ${c} customers onboarded, ${a} accounts opened"
 
-say "Sending the first half of the transactions and of the payments, one every 20 ms"
+say "Sending the first half of the transactions, the payments and the transfers, one every 20 ms"
 python3 -I tools/feed_transactions.py --stream payments --to 56 --pace-ms 20 &
 payments_pid=$!
+python3 -I tools/feed_transactions.py --stream transfers --to 66 --pace-ms 20 &
+transfers_pid=$!
 python3 -I tools/feed_transactions.py --to 150 --pace-ms 20
 wait "${payments_pid}"
+wait "${transfers_pid}"
 for _ in $(seq 1 60); do
   [ "$(graph_count 'MATCH (t:Transaction) RETURN count(t)')" -ge 150 ] 2>/dev/null && break
   sleep 1
@@ -154,6 +161,8 @@ done
 say "Sending the rest, one every 50 ms, and killing Worker 1 while they flow"
 python3 -I tools/feed_transactions.py --stream payments --from 56 --pace-ms 50 &
 payments_pid=$!
+python3 -I tools/feed_transactions.py --stream transfers --from 66 --pace-ms 50 &
+transfers_pid=$!
 python3 -I tools/feed_transactions.py --from 150 --pace-ms 50 &
 feed_pid=$!
 for _ in $(seq 1 120); do
@@ -168,10 +177,12 @@ start_worker 1
 worker1_pid="${last_pid}"
 wait "${feed_pid}"
 wait "${payments_pid}"
+wait "${transfers_pid}"
 
-say "A producer resends a batch it had already delivered, of transactions and of payments"
+say "A producer resends a batch it had already delivered, of each stream"
 scripts/feed.sh retry
 scripts/feed.sh retry-payments
+scripts/feed.sh retry-transfers
 
 say "Checking every store against the demo's data"
 rc=0
@@ -182,6 +193,9 @@ python3 -I tools/check_decisions.py --wait 120 --steady 150 || rc=1
 
 say "Checking every inbound decision, the inbound log and how long each took"
 python3 -I tools/check_inbound.py --wait 120 --steady 56 || rc=1
+
+say "Checking every profile decision, the profile log and how long each took"
+python3 -I tools/check_profiles.py --wait 120 --steady 66 || rc=1
 echo
 echo "Neo4j Browser: http://localhost:${NEO4J_HTTP_PORT} (neo4j / ${NEO4J_PASSWORD})."
 echo "Coordinator: http://localhost:${CLINK_HTTP_PORT}. Logs: ${STATE}."

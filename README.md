@@ -9,7 +9,9 @@ checked against the graph around it once the graph holds it, and every
 transfer is decided as it arrives, hold, review or approve, from where the
 money is going. On the receiving side, payments into the bank's own accounts
 are screened as they land and again as the money leaves, for the marks of a
-money mule. What the checks find is recorded exactly once, in Kafka, in a
+money mule, and transfers out are judged against what is usual for the payer
+and the payee, from profiles the stream keeps up to the transfer itself. What
+the checks find is recorded exactly once, in Kafka, in a
 PostgreSQL case store and on the graph itself; every decision is published the
 moment it is made and logged exactly once in PostgreSQL.
 
@@ -45,6 +47,11 @@ Those are the questions this project asks, of every event, as it arrives.
   whom its owner is connected to, and a payment out is held when it sends a
   credit straight back out: behaviour kept by clink in event time, with the
   graph's identity links beside it.
+- **Profiles kept by the stream.** A transfer out is judged against the
+  payer's own history, whether the payee is new to them, and how many
+  customers paid that payee for the first time that day: three windows in
+  event time, each reading the one before, read in the same step as the
+  decision.
 - **One guarantee per output, each declared.** The graph is written at least
   once with statements that converge when a batch is written again; the
   announcements, the alerts and the case store are written exactly once; a
@@ -79,6 +86,9 @@ flowchart LR
   PAY["Kafka: payments"]
   I["inbound screen<br/>pipeline/inbound.sql"]
   ID["Kafka: inbound-decisions"]
+  TR["Kafka: transfers"]
+  PF["profile decisions<br/>pipeline/profiles.sql"]
+  PD["Kafka: profile-decisions"]
   C --> K
   A --> K
   T --> K
@@ -101,9 +111,13 @@ flowchart LR
   G -. "lookup, read only" .-> I
   I -- "at least once" --> ID
   ID --> L
+  TR --> PF
+  G -. "lookup, read only" .-> PF
+  PF -- "at least once" --> PD
+  PD --> L
 ```
 
-Six clink jobs, each a SQL file:
+Seven clink jobs, each a SQL file:
 
 | Job | Reads | Writes |
 | --- | --- | --- |
@@ -111,8 +125,9 @@ Six clink jobs, each a SQL file:
 | Detectors | committed-customers, committed-transactions | alerts, each keyed by the event that raised it |
 | Case router | alerts | the case store; an Alert node on the graph, linked to what raised it and to its evidence |
 | Decision path | transactions | decisions: hold, review or approve for every transfer, with the reasons and the evidence |
-| Decision logs | decisions, inbound-decisions | the decision log, one row per transfer; the inbound log, one row per inbound decision |
+| Decision logs | decisions, inbound-decisions, profile-decisions | the decision log, one row per transfer; the inbound log, one row per inbound decision; the profile log, one row per transfer out |
 | Inbound screen | payments | inbound-decisions: each credit credited, reviewed or held, and each onward payment that passes a credit straight through held |
+| Profile decisions | transfers | profile-decisions: hold, review or approve for every transfer out, from the payer's and payee's profiles and the payee's place in the graph, with the reasons and the profile |
 
 The detectors ask two questions of the graph, through clink's Neo4j lookup:
 
@@ -199,17 +214,19 @@ time each record arrived.
 
 | From the transfer reaching Kafka to | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| the Neo4j lookup's reply, the decision's context | 15 ms | 23 ms | 265 ms |
-| the decision reaching Kafka | 22 ms | 32 ms | 278 ms |
-| the decision log's row committing in PostgreSQL | 1,239 ms | 1,985 ms | 2,184 ms |
+| the Neo4j lookup's reply, the decision's context | 16 ms | 267 ms | 524 ms |
+| the decision reaching Kafka | 23 ms | 283 ms | 531 ms |
+| the decision log's row committing in PostgreSQL | 994 ms | 1,818 ms | 2,090 ms |
 
 Those are the first 150 transfers of the last run, sent one every 20 ms
 while nothing was failing, on one machine, with Kafka, Neo4j and PostgreSQL
-in Docker and clink on the host. The ten slowest decisions were the run's first
-ten transfers. Neo4j plans the lookup's statement the first time it runs,
-which takes a few hundred milliseconds, and the transfers that arrive
-meanwhile wait for the plan; after it, a decision is on the topic in tens of
-milliseconds.
+in Docker and clink on the host. The twenty slowest decisions were the run's
+first twenty transfers. Neo4j plans a lookup's statement the first time it
+runs it, and the transfers that arrive meanwhile wait for the plan. The
+decision path, the inbound screen and the profile job start reading together,
+each with a lookup of its own, and the first decisions of each waited about
+half a second. From the 52nd transfer on, every decision was on the topic in
+17 to 38 ms.
 
 The decision log trails the decision by about a second. It writes each row
 exactly once, in a transaction that commits when its job's checkpoint
@@ -271,17 +288,90 @@ reached Kafka:
 
 | From the payment reaching Kafka to | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| the Neo4j lookup's reply, for a credit | 16 ms | 260 ms | 274 ms |
-| the decision reaching Kafka | 20 ms | 254 ms | 281 ms |
-| the inbound log's row committing in PostgreSQL | 1,486 ms | 2,119 ms | 2,185 ms |
+| the Neo4j lookup's reply, for a credit | 185 ms | 520 ms | 544 ms |
+| the decision reaching Kafka | 56 ms | 531 ms | 551 ms |
+| the inbound log's row committing in PostgreSQL | 936 ms | 1,540 ms | 1,589 ms |
 
 Those are the decisions on the first half of the payments in the same run,
-sent one every 20 ms beside the transactions while nothing was failing. The
-tail is the stream's first credits: Neo4j plans the screen's lookup the first
-time it runs it, and the credits that landed while it did so waited for it.
-From the twentieth payment on, every credit was decided and published in 17 to
-24 ms. Payments out need no lookup: the fifteen onward holds, which the
-decision row counts too, were published in 11 to 29 ms from the first.
+sent one every 20 ms beside the transactions and the transfers while nothing
+was failing. That half took 1.3 seconds to send, and most of its credits
+landed in the first second, while the lookups were starting: that is the
+tail, and here the median too. The last four credits of the half were decided
+and published in 21 to 39 ms. Payments out need no lookup: the fifteen onward
+holds, which the decision row counts too, were published in 14 to 41 ms from
+the first.
+
+## Judging a transfer against the payer's history
+
+The decision path judges a transfer by where the money is going. A payment can
+also be wrong for the person sending it. The first payment to someone new, at
+several times what they usually send, is how an authorised push payment scam
+tends to look, and several customers paying the same new account in one
+morning is how it looks from the bank's side. Profiles like these are often
+built overnight and read at decision time; a stream can keep them current to
+the transfer being decided and read them in the same step.
+
+The demo gives each payer two or three transfers a year, too few to say what
+is usual for anyone. `tools/transfer_history.py` writes a third stream,
+`transfers`, from fourteen of the demo's customers: four weeks in which each
+pays a few regular payees around an amount usual for them, then a morning.
+
+| Payers | That morning |
+| --- | --- |
+| 4 scam victims | each pays one account outside the bank for the first time, four to eight times their usual amount; the first pays it twice, and the fourth sends an amount that is ordinary for them |
+| 1 more | pays an account whose owner the graph links to a flagged customer, an ordinary amount |
+| 6 near misses | a new payee, an ordinary amount; five times the usual amount to a payee paid for weeks; six times it to a new payee, with two transfers of history; one payee paid for the first time by two customers; five times the usual amount to a payee first paid thirty hours earlier |
+| 3 ordinary | pay their regular payees |
+
+`pipeline/profiles.sql` keeps three profiles, each an `OVER` window in event
+time, and reads the payee's place in the graph as the decision path does:
+
+| Profile | Kept per | As of each transfer |
+| --- | --- | --- |
+| history | payer | the payer's transfers in the last 28 days (`RANGE BETWEEN INTERVAL '28' DAY PRECEDING`), counted and totalled, so the average before this one |
+| first payment | payer and payee | when the payer first paid this payee (`FIRST_VALUE(ts)`), so whether the payee is new: first paid within the last day |
+| new payers | payee | how many payers paid this payee for the first time in the last day |
+
+The windows of one query share a partitioning, so each profile is a window
+over the one before: per payer, then per payer and payee, then per payee.
+
+| Reason | When | Decision |
+| --- | --- | --- |
+| `payee_flagged`, `payee_linked` | as the decision path | hold |
+| `payee_fan_in` | the payee is new, and three or more payers paid it for the first time in the last day | hold |
+| `unusual_amount` | the payee is new, and the amount is at least three times the payer's average over three or more transfers in 28 days | review |
+| `payee_high_risk`, `payee_near` | as the decision path | review |
+
+The first victim's two payments and the second victim's are reviewed as
+unusual amounts. With the third victim the account has its third new payer of
+the day, and it is held from then on: the fourth victim's payment is held
+though the amount is ordinary for them. The graph knows nothing of that
+account; the profiles do. The payment to the linked account is held by the
+graph. No near miss is held or reviewed, and none of the 127 transfers of the
+four weeks before.
+
+The transfers stream is in time order and declares no watermark lag, as the
+payments stream does, so each transfer's own watermark lets the windows act on
+it at once, and a copy a producer resends arrives behind the watermark, where
+all three windows drop it. Each window's state is checkpointed with the job,
+so a restored worker carries on with the profiles it had.
+
+`tools/check_profiles.py` computes every profile from the transfers alone and
+checks each decision's profile against its own, value for value, as well as
+the decision, and times every decision as the other checks do:
+
+| From the transfer reaching Kafka to | p50 | p90 | p99 |
+| --- | --- | --- | --- |
+| the Neo4j lookup's reply | 195 ms | 513 ms | 540 ms |
+| the decision reaching Kafka | 228 ms | 519 ms | 549 ms |
+| the profile log's row committing in PostgreSQL | 880 ms | 1,534 ms | 2,077 ms |
+
+Those are the first 66 transfers in the same run, the start of the four
+weeks, sent one every 20 ms beside the transactions and the payments while
+nothing was failing. They took 1.6 seconds to send, so the start described
+above covers most of them, the median included. From the 54th transfer on,
+every decision was published in 16 to 44 ms, about what the decision path
+takes: the three windows add little to a decision.
 
 ## What a run checks
 
@@ -297,26 +387,30 @@ same for every decision, computing each from the event streams alone:
 | alerts | the 54 alerts the demo's data implies, 4 rings and 50 shared identities, each once | 54, none twice |
 | The case store | one row per alert | 54 |
 | The alert graph | one Alert node per alert, linked to what raised it and to its evidence | 54 |
-| decisions | a decision for every transfer, each the one the demo's data implies, computed without the graph, and every copy of it the same | all 300 right, and 29 published again after the restore and the resend, each the same |
+| decisions | a decision for every transfer, each the one the demo's data implies, computed without the graph, and every copy of it the same | all 300 right, and 40 published again after the restore and the resend, each the same |
 | The decision log | one row per transfer, each as expected | 300, one per transfer |
-| inbound-decisions | a decision for every credit and every onward payment that passes a credit straight through, each the one the payments imply, computed without the graph, every copy of it the same, and nothing else | all 80 right, none published twice |
+| inbound-decisions | a decision for every credit and every onward payment that passes a credit straight through, each the one the payments imply, computed without the graph, every copy of it the same, and nothing else | all 80 right, and 8 published again after the restore, each the same |
 | The inbound log | one row per inbound decision, each as expected | 80, one per decision |
+| profile-decisions | a decision for every transfer out, each the one the transfers imply, computed without the graph, with the profile it was made from, every copy the same, and nothing else | all 133 right, each with the profile it was made from, and 2 published again after the restore, each the same |
+| The profile log | one row per transfer out, each as expected | 133, one per transfer |
 
 In that run a Worker was killed with SIGKILL while the second half of the
 transactions was flowing, with 166 of the 300 in the graph, and every job
 restored from its last completed checkpoint. A producer then resent 20
-transactions and 10 payments it had already delivered. The keeper writes each
-resent transaction again, which the graph absorbs and the announcements
-carry, and the detectors read each event once (`SELECT DISTINCT`, remembered
-for an hour), so no alert is raised twice. The decision path decides again
-the transfers it had read after its checkpoint, and the resent ones, the same
-way, and the decision log holds each once. The inbound screens drop the
-resent payments, and the restore read again no payment the inbound screen
-had decided, so in that run each inbound decision was published once.
+transactions, 10 payments and 10 transfers out it had already delivered. The
+keeper writes each resent transaction again, which the graph absorbs and the
+announcements carry, and the detectors read each event once
+(`SELECT DISTINCT`, remembered for an hour), so no alert is raised twice. The
+decision path decides again the transfers it had read after its checkpoint,
+and the resent ones, the same way, and the decision log holds each once. The
+inbound screens and the profile windows drop the resent payments and
+transfers, so every inbound or profile decision published twice was one the
+restore made again, the same way, and the inbound and profile logs hold each
+decision once.
 
 ## What it asked of clink
 
-Two capabilities were added to clink for this project:
+Three capabilities were added to clink for this project:
 
 - **A guarantee per sink.** A statement set used to be held to the strongest
   guarantee any of its tables declared, so the keeper, which writes Neo4j at
@@ -326,8 +420,12 @@ Two capabilities were added to clink for this project:
 - **One reader per table.** `shared_reader='true'` gives every statement of a
   job that reads a Kafka table one consumer between them, cut at the same
   checkpoint barriers.
+- **A window over a window.** The `OVER` aggregates of one query share a
+  partitioning, and a window could not read another, so a profile per payer
+  and payee could not follow one per payer. A window over a window now reads
+  the first one's event-time column, and each row keeps its event time.
 
-Both are on clink's main branch after v0.12.2.
+All three are on clink's main branch after v0.12.2.
 
 ## Running it
 
@@ -341,13 +439,14 @@ host ports.
 
 `run.sh` fetches the demo at a pinned commit (checked against
 `scripts/neo4j-demo.sha256`), turns it into the three event streams and
-writes the payments beside them, starts Kafka, Neo4j and PostgreSQL in Docker,
-and runs a Coordinator and two Workers from the clink build. It submits the six
-jobs, sends the onboardings and the accounts and waits until the graph holds
-them, sends the first half of the transactions and of the payments one every
-20 ms, sends the rest one every 50 ms and kills a Worker with SIGKILL while
-they flow, starts it again, resends a batch of each as a producer that retried
-would, and then checks every store and every decision.
+writes the payments and the transfers beside them, starts Kafka, Neo4j and
+PostgreSQL in Docker, and runs a Coordinator and two Workers from the clink
+build. It submits the seven jobs, sends the onboardings and the accounts and
+waits until the graph holds them, sends the first half of the transactions,
+the payments and the transfers one every 20 ms, sends the rest one every 50 ms
+and kills a Worker with SIGKILL while they flow, starts it again, resends a
+batch of each as a producer that retried would, and then checks every store
+and every decision.
 
 To check the graph statements and the detector reads against Neo4j without
 clink, `tools/graph_check.py` applies them as the sink and the lookup do,

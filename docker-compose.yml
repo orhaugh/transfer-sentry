@@ -53,6 +53,10 @@ services:
   #                                       accounts, minute by minute
   #   inbound-decisions                   each credit decided, each onward
   #                                       payment held
+  #   transfers                           transfers out of the bank's
+  #                                       accounts, four weeks and a morning
+  #   profile-decisions                   each transfer decided from its
+  #                                       payer's and payee's profiles
   kafka-init:
     image: apache/kafka:3.9.1
     depends_on:
@@ -68,7 +72,8 @@ services:
         done
         # Stamped by the broker as each record arrives, so the decision paths'
         # latency is measured from when a transfer or payment reached Kafka.
-        for t in transactions decisions payments inbound-decisions; do
+        for t in transactions decisions payments inbound-decisions transfers \
+                 profile-decisions; do
           /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
             --topic "$$t" --partitions 1 --replication-factor 1 \
             --config message.timestamp.type=LogAppendTime

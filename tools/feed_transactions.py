@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send transactions, or payments, onto their topic at a steady pace, each
+"""Send transactions, payments or transfers onto their topic at a steady pace, each
 stamped with the moment it was sent.
 
 The decision paths' latency is measured from when each one reached Kafka (the
@@ -11,7 +11,7 @@ it is read rather than waiting to fill a batch, and is given a few seconds to
 start before the first transfer, so the first ones are not held while its JVM
 starts and then arrive together.
 
-  --stream S        transactions (the default) or payments
+  --stream S        transactions (the default), payments or transfers
   --from N --to M   which events, by position in the stream (0-based, M
                     exclusive; default all)
   --pace-ms P       wait P ms between events (default 20)
@@ -34,7 +34,7 @@ WARM_UP_S = 4
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--events", default=str(ROOT / "state" / "demo-events"))
-    ap.add_argument("--stream", choices=("transactions", "payments"), default="transactions")
+    ap.add_argument("--stream", choices=("transactions", "payments", "transfers"), default="transactions")
     ap.add_argument("--from", dest="start", type=int, default=0)
     ap.add_argument("--to", dest="stop", type=int, default=None)
     ap.add_argument("--pace-ms", type=int, default=20)

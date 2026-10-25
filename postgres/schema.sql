@@ -48,3 +48,17 @@ CREATE TABLE IF NOT EXISTS inbound_log (
     ts_ms       bigint
 );
 CREATE INDEX IF NOT EXISTS inbound_log_payment_id ON inbound_log (payment_id);
+
+-- The profile log: one row per transfer decided from its payer's and payee's
+-- profiles, written exactly once by pipeline/audit.sql.
+CREATE TABLE IF NOT EXISTS profile_log (
+    transfer_id  text   NOT NULL,
+    decision     text   NOT NULL,
+    reasons      text,
+    evidence     text,
+    from_account text,
+    to_account   text,
+    amount       double precision,
+    ts_ms        bigint
+);
+CREATE INDEX IF NOT EXISTS profile_log_transfer_id ON profile_log (transfer_id);
