@@ -32,9 +32,8 @@ CREATE TABLE payments (
     event_time_column = 'ts',
     -- The stream is in time order, so a payment's own watermark lets the
     -- credit window act on it at once, and a copy a producer resends arrives
-    -- behind the watermark, where the window drops it rather than count it
-    -- again. The pass-through pattern matches payments as they arrive, so it
-    -- can hold a resent debit a second time, the same way.
+    -- behind the watermark, where both screens drop it rather than count or
+    -- match it again.
     watermark_lag_ms  = '0'
 );
 

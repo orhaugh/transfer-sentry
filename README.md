@@ -199,9 +199,9 @@ time each record arrived.
 
 | From the transfer reaching Kafka to | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| the Neo4j lookup's reply, the decision's context | 15 ms | 46 ms | 313 ms |
-| the decision reaching Kafka | 22 ms | 53 ms | 321 ms |
-| the decision log's row committing in PostgreSQL | 1,167 ms | 1,957 ms | 2,150 ms |
+| the Neo4j lookup's reply, the decision's context | 15 ms | 29 ms | 272 ms |
+| the decision reaching Kafka | 22 ms | 34 ms | 282 ms |
+| the decision log's row committing in PostgreSQL | 990 ms | 1,745 ms | 2,055 ms |
 
 Those are the first 150 transfers of the last run, sent one every 20 ms
 while nothing was failing, on one machine, with Kafka, Neo4j and PostgreSQL
@@ -259,29 +259,29 @@ account is held.
 The stream is in time order and declares no watermark lag, so each payment's
 own watermark lets the credit window act on it at once, and the pass-through
 pattern matches payments as they arrive. A copy a producer resends arrives
-behind the watermark. The credit window drops it rather than count it twice;
-the pattern can match a resent credit and debit once more and hold the debit
-again, the same way, so a consumer keeps the first decision for each payment,
-and the inbound log holds each once. Each account's window and
-pattern state is checkpointed with the job, so a restored worker carries on
-with the counts it had.
+behind the watermark, and both screens drop it: the credit window does not
+count it twice, and the pattern does not match it again. Each account's
+window and pattern state is checkpointed with the job, so a restored worker
+carries on with the counts it had. A restore screens again the payments read
+after its checkpoint, each the same way, so a consumer keeps the first
+decision for each payment; the inbound log holds each once.
 
 `tools/check_inbound.py` times every inbound decision from when its payment
 reached Kafka:
 
 | From the payment reaching Kafka to | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| the Neo4j lookup's reply, for a credit | 16 ms | 295 ms | 315 ms |
-| the decision reaching Kafka | 19 ms | 290 ms | 319 ms |
-| the inbound log's row committing in PostgreSQL | 1,573 ms | 2,165 ms | 2,319 ms |
+| the Neo4j lookup's reply, for a credit | 23 ms | 244 ms | 270 ms |
+| the decision reaching Kafka | 22 ms | 245 ms | 281 ms |
+| the inbound log's row committing in PostgreSQL | 1,025 ms | 1,594 ms | 1,668 ms |
 
 Those are the decisions on the first half of the payments in the same run,
 sent one every 20 ms beside the transactions while nothing was failing. The
 tail is the stream's first credits: Neo4j plans the screen's lookup the first
 time it runs it, and the credits that landed while it did so waited for it.
-From the twentieth payment on, every credit was decided and published in 17 to
-22 ms. Payments out need no lookup, and the fifteen onward holds were
-published in 12 to 39 ms from the first.
+From the twentieth payment on, every credit was decided and published in 18 to
+42 ms. Payments out need no lookup: the fifteen onward holds, which the
+decision row counts too, were published in 12 to 22 ms from the first.
 
 ## What a run checks
 
@@ -297,19 +297,22 @@ same for every decision, computing each from the event streams alone:
 | alerts | the 54 alerts the demo's data implies, 4 rings and 50 shared identities, each once | 54, none twice |
 | The case store | one row per alert | 54 |
 | The alert graph | one Alert node per alert, linked to what raised it and to its evidence | 54 |
-| decisions | a decision for every transfer, each the one the demo's data implies, computed without the graph, and every copy of it the same | all 300 right, and 41 published again after the restore, each the same |
+| decisions | a decision for every transfer, each the one the demo's data implies, computed without the graph, and every copy of it the same | all 300 right, and 37 published again after the restore and the resend, each the same |
 | The decision log | one row per transfer, each as expected | 300, one per transfer |
-| inbound-decisions | a decision for every credit and every onward payment that passes a credit straight through, each the one the payments imply, computed without the graph, every copy of it the same, and nothing else | all 80 right, and 18 published again after the restore and the resend, each the same |
+| inbound-decisions | a decision for every credit and every onward payment that passes a credit straight through, each the one the payments imply, computed without the graph, every copy of it the same, and nothing else | all 80 right, and 15 published again after the restore, each the same |
 | The inbound log | one row per inbound decision, each as expected | 80, one per decision |
 
 In that run a Worker was killed with SIGKILL while the second half of the
-transactions was flowing, with 170 of the 300 in the graph, and every job
+transactions was flowing, with 166 of the 300 in the graph, and every job
 restored from its last completed checkpoint. A producer then resent 20
-transactions it had already delivered. The keeper writes each resent record
-again, which the graph absorbs and the announcements carry, and the detectors
-read each event once (`SELECT DISTINCT`, remembered for an hour), so no alert
-is raised twice. The decision path decides again the transfers it had read
-after its checkpoint, the same way, and the decision log holds each once.
+transactions and 10 payments it had already delivered. The keeper writes each
+resent transaction again, which the graph absorbs and the announcements
+carry, and the detectors read each event once (`SELECT DISTINCT`, remembered
+for an hour), so no alert is raised twice. The decision path decides again
+the transfers it had read after its checkpoint, and the resent ones, the same
+way, and the decision log holds each once. The inbound screens drop the
+resent payments, so the inbound decisions published again are the ones the
+restore read again.
 
 ## What it asked of clink
 
