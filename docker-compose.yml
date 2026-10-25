@@ -33,10 +33,14 @@ services:
       - "${KAFKA_HOST_PORT:-29092}:29092"
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
-      interval: 5s
+      # Each check starts a JVM, which costs the broker's container a core
+      # for a second or two: every 2 s while it starts, every 30 s after, so
+      # the checks stay out of the latency the run measures.
+      start_period: 60s
+      start_interval: 2s
+      interval: 30s
       timeout: 10s
-      retries: 24
-      start_period: 10s
+      retries: 5
 
   # The topics, one partition each, so each stream keeps the order it was
   # produced in:
@@ -45,6 +49,10 @@ services:
   #   committed-transactions              announced once the graph holds it
   #   alerts                              what the detectors found
   #   decisions                           one decision per transfer
+  #   payments                            money into and out of the bank's
+  #                                       accounts, minute by minute
+  #   inbound-decisions                   each credit decided, each onward
+  #                                       payment held
   kafka-init:
     image: apache/kafka:3.9.1
     depends_on:
@@ -58,9 +66,9 @@ services:
           /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
             --topic "$$t" --partitions 1 --replication-factor 1
         done
-        # Stamped by the broker as each record arrives, so the decision path's
-        # latency is measured from when a transfer reached Kafka.
-        for t in transactions decisions; do
+        # Stamped by the broker as each record arrives, so the decision paths'
+        # latency is measured from when a transfer or payment reached Kafka.
+        for t in transactions decisions payments inbound-decisions; do
           /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
             --topic "$$t" --partitions 1 --replication-factor 1 \
             --config message.timestamp.type=LogAppendTime

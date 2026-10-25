@@ -4,7 +4,7 @@
 # transactions in date order. The producer runs inside the broker container,
 # so nothing beyond Docker is needed on the host.
 #
-#   scripts/feed.sh [all|onboard|first|second|retry] [events dir]
+#   scripts/feed.sh [all|onboard|first|second|retry|retry-payments] [events dir]
 #     all      everything (the default)
 #     onboard  the customers and the accounts, no transactions
 #     first    the customers, the accounts and the first half of the
@@ -12,6 +12,9 @@
 #     second   the rest of the transactions
 #     retry    the 20 transactions before the halfway point again: a
 #              producer that retried a batch it had delivered
+#     retry-payments
+#              the 10 payments before the halfway point of the payments
+#              stream again
 #   PACE_MS=50 scripts/feed.sh second
 #              one record every 50 ms, so the stream is still flowing while
 #              something else happens
@@ -64,8 +67,13 @@ case "${PART}" in
     head -n "${half}" "${EVENTS}/transactions.jsonl" | tail -n 20 >"${part}"
     produce transactions "${part}"
     ;;
+  retry-payments)
+    payments_half=$(($(wc -l <"${EVENTS}/payments.jsonl" | tr -d ' ') / 2))
+    head -n "${payments_half}" "${EVENTS}/payments.jsonl" | tail -n 10 >"${part}"
+    produce payments "${part}"
+    ;;
   *)
-    echo "feed.sh: unknown part '${PART}' (all, onboard, first, second or retry)" >&2
+    echo "feed.sh: unknown part '${PART}' (all, onboard, first, second, retry or retry-payments)" >&2
     exit 2
     ;;
 esac

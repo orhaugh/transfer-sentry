@@ -35,6 +35,7 @@ Usage: tools/check_decisions.py [--wait 120] [--steady 150]
 
 import argparse
 import collections
+import importlib.util
 import json
 import statistics
 import subprocess
@@ -43,7 +44,16 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-KINDS = ("email_id", "phone_id", "address_id")
+
+
+def load_sibling(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "tools" / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+identity = load_sibling("identity")
 
 
 def compose(*args):
@@ -51,53 +61,18 @@ def compose(*args):
                           capture_output=True, text=True).stdout
 
 
-def read_events(events):
-    load = lambda n: [json.loads(line) for line in (Path(events) / f"{n}.jsonl").open()]
-    return load("customers"), load("accounts"), load("transactions")
-
-
 def expected_decisions(customers, accounts, transactions):
     """transaction id -> {decision, reasons, evidence}."""
-    by_id = {c["customer_id"]: c for c in customers}
-    holders = collections.defaultdict(set)  # (kind, identifier id) -> customers
-    for c in customers:
-        for kind in KINDS:
-            if c[kind] is not None:
-                holders[(kind, c[kind])].add(c["customer_id"])
-
-    def shares(cid):
-        out = set()
-        for kind in KINDS:
-            value = by_id[cid][kind]
-            if value is not None:
-                out |= holders[(kind, value)]
-        out.discard(cid)
-        return out
-
-    account = {a["account_id"]: a for a in accounts}
-    context = {}
-    for aid, a in account.items():
-        owner = a["customer_id"]
-        if owner is None or owner not in by_id:
-            one, two = set(), set()
-            flagged = False
-        else:
-            flagged = by_id[owner]["fraud_flag"]
-            near = shares(owner)
-            one = {o for o in near if by_id[o]["fraud_flag"]}
-            two = set()
-            for m in near:
-                for o in shares(m):
-                    if o not in (owner, m) and by_id[o]["fraud_flag"] and o not in one:
-                        two.add(o)
-        high_risk = a["high_risk_jurisdiction"]
+    decided = {}
+    for aid, c in identity.account_contexts(customers, accounts).items():
+        flagged, one, two, high_risk = c["owner_flagged"], c["one"], c["two"], c["high_risk"]
         reasons = [r for r, on in (("payee_flagged", flagged), ("payee_linked", bool(one)),
                                    ("payee_high_risk", high_risk), ("payee_near", bool(two)))
                    if on]
         decision = ("hold" if flagged or one else "review" if high_risk or two else "approve")
-        context[aid] = {"decision": decision, "reasons": ",".join(reasons),
-                        "evidence": ",".join((sorted(one) + sorted(two))[:10])}
-    return {t["transaction_id"]: context[t["to_account_id"]] for t in transactions}
+        decided[aid] = {"decision": decision, "reasons": ",".join(reasons),
+                        "evidence": identity.evidence(c)}
+    return {t["transaction_id"]: decided[t["to_account_id"]] for t in transactions}
 
 
 def stamped_topic(name):
@@ -161,7 +136,8 @@ def main():
     ap.add_argument("--wait", type=int, default=0)
     ap.add_argument("--steady", type=int, default=0)
     args = ap.parse_args()
-    customers, accounts, transactions = read_events(args.events)
+    customers, accounts, transactions = identity.read_events(
+        args.events, "customers", "accounts", "transactions")
     want = expected_decisions(customers, accounts, transactions)
 
     deadline = time.time() + args.wait

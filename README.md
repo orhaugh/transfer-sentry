@@ -7,7 +7,9 @@ its data and its dashboard) and runs it as a stream. Onboardings, account
 openings and transfers are written into the graph as they happen. Each one is
 checked against the graph around it once the graph holds it, and every
 transfer is decided as it arrives, hold, review or approve, from where the
-money is going. What the checks find is recorded exactly once, in Kafka, in a
+money is going. On the receiving side, payments into the bank's own accounts
+are screened as they land and again as the money leaves, for the marks of a
+money mule. What the checks find is recorded exactly once, in Kafka, in a
 PostgreSQL case store and on the graph itself; every decision is published the
 moment it is made and logged exactly once in PostgreSQL.
 
@@ -38,6 +40,11 @@ Those are the questions this project asks, of every event, as it arrives.
 - **Mule-chain context.** A decision reads not only who owns the payee account
   but whom that owner shares an email address, phone number or street address
   with, one and two steps away, and which of them the bank has flagged.
+- **The receiving side.** Credits into the bank's accounts are screened as
+  they land, from how many credits the account has taken in the last hour and
+  whom its owner is connected to, and a payment out is held when it sends a
+  credit straight back out: behaviour kept by clink in event time, with the
+  graph's identity links beside it.
 - **One guarantee per output, each declared.** The graph is written at least
   once with statements that converge when a batch is written again; the
   announcements, the alerts and the case store are written exactly once; a
@@ -65,10 +72,13 @@ flowchart LR
   D["detectors<br/>pipeline/detectors.sql"]
   AL["Kafka: alerts"]
   R["case router<br/>pipeline/cases.sql"]
-  P[("PostgreSQL<br/>cases, decision log")]
+  P[("PostgreSQL<br/>cases, decision logs")]
   X["decision path<br/>pipeline/decisions.sql"]
   DE["Kafka: decisions"]
-  L["decision log<br/>pipeline/audit.sql"]
+  L["decision logs<br/>pipeline/audit.sql"]
+  PAY["Kafka: payments"]
+  I["inbound screen<br/>pipeline/inbound.sql"]
+  ID["Kafka: inbound-decisions"]
   C --> K
   A --> K
   T --> K
@@ -87,9 +97,13 @@ flowchart LR
   X -- "at least once" --> DE
   DE --> L
   L -- "exactly once" --> P
+  PAY --> I
+  G -. "lookup, read only" .-> I
+  I -- "at least once" --> ID
+  ID --> L
 ```
 
-Five clink jobs, each a SQL file:
+Six clink jobs, each a SQL file:
 
 | Job | Reads | Writes |
 | --- | --- | --- |
@@ -97,7 +111,8 @@ Five clink jobs, each a SQL file:
 | Detectors | committed-customers, committed-transactions | alerts, each keyed by the event that raised it |
 | Case router | alerts | the case store; an Alert node on the graph, linked to what raised it and to its evidence |
 | Decision path | transactions | decisions: hold, review or approve for every transfer, with the reasons and the evidence |
-| Decision log | decisions | the decision log, one row per transfer |
+| Decision logs | decisions, inbound-decisions | the decision log, one row per transfer; the inbound log, one row per inbound decision |
+| Inbound screen | payments | inbound-decisions: each credit credited, reviewed or held, and each onward payment that passes a credit straight through held |
 
 The detectors ask two questions of the graph, through clink's Neo4j lookup:
 
@@ -184,9 +199,9 @@ time each record arrived.
 
 | From the transfer reaching Kafka to | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| the Neo4j lookup's reply, the decision's context | 15 ms | 22 ms | 250 ms |
-| the decision reaching Kafka | 23 ms | 29 ms | 281 ms |
-| the decision log's row committing in PostgreSQL | 951 ms | 1,854 ms | 2,009 ms |
+| the Neo4j lookup's reply, the decision's context | 15 ms | 46 ms | 313 ms |
+| the decision reaching Kafka | 22 ms | 53 ms | 321 ms |
+| the decision log's row committing in PostgreSQL | 1,167 ms | 1,957 ms | 2,150 ms |
 
 Those are the first 150 transfers of the last run, sent one every 20 ms
 while nothing was failing, on one machine, with Kafka, Neo4j and PostgreSQL
@@ -206,12 +221,74 @@ broker's and PostgreSQL's, which run in Docker and can differ from the host's
 by a millisecond or two. How long the feeder itself took to get each
 transfer to Kafka is reported apart, and is not in these figures.
 
+## Screening what comes in
+
+A mule account takes money from many payers and sends it on within minutes.
+Under the UK's reimbursement rules for authorised push payment fraud, the bank
+that received the money pays half of what is refunded, so the receiving bank
+has two moments to act: when a credit lands, and when the money leaves again.
+
+The demo's transactions are a year at the granularity of a day, too coarse to
+show either. `tools/payment_flows.py` writes a second stream, `payments`, over
+one synthetic morning after the demo's last transaction. It uses the demo's
+own internal accounts, so the graph knows every account's owner and whom that
+owner is connected to, and it is seeded, so every run writes the same stream:
+
+| Accounts | What they do |
+| --- | --- |
+| 4 mules | a credit from a different payer every six to nine minutes, six to eight in all, each 85% to 97% sent on within five minutes; two have owners the graph links to a flagged customer, two do not |
+| 5 near misses | three credits within an hour; 70% sent on; 95% sent on after 45 minutes; a credit sent on after a second, smaller credit landed; five credits over three hours |
+| 8 ordinary | a salary, then a few bills |
+| 4 known links | ordinary activity, owners one or two steps from a flagged customer |
+
+`pipeline/inbound.sql` screens both moments:
+
+| Moment | Reason | What it sees | Decision |
+| --- | --- | --- | --- |
+| A credit lands | `receiver_flagged`, `receiver_linked` | the account's owner is flagged, or shares an identifier with a flagged customer (the graph) | hold |
+| | `fan_in` | the fourth credit or more into the account within the hour (`OVER`, in event time) | hold |
+| | `receiver_near` | the owner is two shared identifiers from a flagged customer (the graph) | review |
+| The money leaves | `pass_through` | a debit straight after a credit, of 80% to 100% of it, within half an hour (`MATCH_RECOGNIZE`) | hold the debit |
+
+The graph holds the two linked mules' credits from the first, and behaviour
+holds the other two's from their fourth. Every payment out of every mule is
+held as it passes the money on, including the money from the three credits
+each of those two took before fan-in counted. No near miss and no ordinary
+account is held.
+
+The stream is in time order and declares no watermark lag, so each payment's
+own watermark lets the credit window act on it at once, and the pass-through
+pattern matches payments as they arrive. A copy a producer resends arrives
+behind the watermark. The credit window drops it rather than count it twice;
+the pattern can match a resent credit and debit once more and hold the debit
+again, the same way, so a consumer keeps the first decision for each payment,
+and the inbound log holds each once. Each account's window and
+pattern state is checkpointed with the job, so a restored worker carries on
+with the counts it had.
+
+`tools/check_inbound.py` times every inbound decision from when its payment
+reached Kafka:
+
+| From the payment reaching Kafka to | p50 | p90 | p99 |
+| --- | --- | --- | --- |
+| the Neo4j lookup's reply, for a credit | 16 ms | 295 ms | 315 ms |
+| the decision reaching Kafka | 19 ms | 290 ms | 319 ms |
+| the inbound log's row committing in PostgreSQL | 1,573 ms | 2,165 ms | 2,319 ms |
+
+Those are the decisions on the first half of the payments in the same run,
+sent one every 20 ms beside the transactions while nothing was failing. The
+tail is the stream's first credits: Neo4j plans the screen's lookup the first
+time it runs it, and the credits that landed while it did so waited for it.
+From the twentieth payment on, every credit was decided and published in 17 to
+22 ms. Payments out need no lookup, and the fifteen onward holds were
+published in 12 to 39 ms from the first.
+
 ## What a run checks
 
 `tools/check_run.py` reads every store through a client of its own and
 compares it with what the demo's export says it must hold, computed without
-the pipeline, and `tools/check_decisions.py` does the same for every decision,
-computing each from the event streams alone:
+the pipeline; `tools/check_decisions.py` and `tools/check_inbound.py` do the
+same for every decision, computing each from the event streams alone:
 
 | Store | What it must hold | Last run |
 | --- | --- | --- |
@@ -220,11 +297,13 @@ computing each from the event streams alone:
 | alerts | the 54 alerts the demo's data implies, 4 rings and 50 shared identities, each once | 54, none twice |
 | The case store | one row per alert | 54 |
 | The alert graph | one Alert node per alert, linked to what raised it and to its evidence | 54 |
-| decisions | a decision for every transfer, each the one the demo's data implies, computed without the graph, and every copy of it the same | all 300 right, and 36 published again after the restore, each the same |
+| decisions | a decision for every transfer, each the one the demo's data implies, computed without the graph, and every copy of it the same | all 300 right, and 41 published again after the restore, each the same |
 | The decision log | one row per transfer, each as expected | 300, one per transfer |
+| inbound-decisions | a decision for every credit and every onward payment that passes a credit straight through, each the one the payments imply, computed without the graph, every copy of it the same, and nothing else | all 80 right, and 18 published again after the restore and the resend, each the same |
+| The inbound log | one row per inbound decision, each as expected | 80, one per decision |
 
 In that run a Worker was killed with SIGKILL while the second half of the
-transactions was flowing, with 166 of the 300 in the graph, and every job
+transactions was flowing, with 170 of the 300 in the graph, and every job
 restored from its last completed checkpoint. A producer then resent 20
 transactions it had already delivered. The keeper writes each resent record
 again, which the graph absorbs and the announcements carry, and the detectors
@@ -258,13 +337,14 @@ and `clink`); clink runs on the host, and reaches the services through their
 host ports.
 
 `run.sh` fetches the demo at a pinned commit (checked against
-`scripts/neo4j-demo.sha256`), turns it into the three event streams, starts
-Kafka, Neo4j and PostgreSQL in Docker, and runs a Coordinator and two Workers
-from the clink build. It submits the five jobs, sends the onboardings and the
-accounts and waits until the graph holds them, sends the first half of the
-transactions one every 20 ms, sends the rest one every 50 ms and kills a
-Worker with SIGKILL while they flow, starts it again, resends a batch as a
-producer that retried would, and then checks every store and every decision.
+`scripts/neo4j-demo.sha256`), turns it into the three event streams and
+writes the payments beside them, starts Kafka, Neo4j and PostgreSQL in Docker,
+and runs a Coordinator and two Workers from the clink build. It submits the six
+jobs, sends the onboardings and the accounts and waits until the graph holds
+them, sends the first half of the transactions and of the payments one every
+20 ms, sends the rest one every 50 ms and kills a Worker with SIGKILL while
+they flow, starts it again, resends a batch of each as a producer that retried
+would, and then checks every store and every decision.
 
 To check the graph statements and the detector reads against Neo4j without
 clink, `tools/graph_check.py` applies them as the sink and the lookup do,

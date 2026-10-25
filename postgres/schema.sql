@@ -34,3 +34,17 @@ CREATE TABLE IF NOT EXISTS decision_log (
     ts_ms          bigint
 );
 CREATE INDEX IF NOT EXISTS decision_log_transaction_id ON decision_log (transaction_id);
+
+-- The inbound log: one row per inbound decision, a credit decided or an
+-- onward payment held, written exactly once by pipeline/audit.sql.
+CREATE TABLE IF NOT EXISTS inbound_log (
+    payment_id  text   NOT NULL,
+    account     text,
+    direction   text   NOT NULL,
+    decision    text   NOT NULL,
+    reasons     text,
+    evidence    text,
+    amount      double precision,
+    ts_ms       bigint
+);
+CREATE INDEX IF NOT EXISTS inbound_log_payment_id ON inbound_log (payment_id);
