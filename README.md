@@ -214,19 +214,19 @@ time each record arrived.
 
 | From the transfer reaching Kafka to | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| the Neo4j lookup's reply, the decision's context | 16 ms | 267 ms | 524 ms |
-| the decision reaching Kafka | 23 ms | 283 ms | 531 ms |
-| the decision log's row committing in PostgreSQL | 994 ms | 1,818 ms | 2,090 ms |
+| the Neo4j lookup's reply, the decision's context | 17 ms | 199 ms | 440 ms |
+| the decision reaching Kafka | 23 ms | 214 ms | 479 ms |
+| the decision log's row committing in PostgreSQL | 1,013 ms | 1,865 ms | 2,033 ms |
 
-Those are the first 150 transfers of the last run, sent one every 20 ms
-while nothing was failing, on one machine, with Kafka, Neo4j and PostgreSQL
-in Docker and clink on the host. The twenty slowest decisions were the run's
-first twenty transfers. Neo4j plans a lookup's statement the first time it
+Those are the first 150 transfers of the last run, sent one every 20 ms while
+nothing was failing, on one machine, with Kafka, Neo4j and PostgreSQL in
+Docker and clink on the host. The nineteen slowest decisions were the run's
+first nineteen transfers. Neo4j plans a lookup's statement the first time it
 runs it, and the transfers that arrive meanwhile wait for the plan. The
 decision path, the inbound screen and the profile job start reading together,
 each with a lookup of its own, and the first decisions of each waited about
-half a second. From the 52nd transfer on, every decision was on the topic in
-17 to 38 ms.
+half a second. From the 41st transfer on, every decision was on the topic in
+13 to 49 ms.
 
 The decision log trails the decision by about a second. It writes each row
 exactly once, in a transaction that commits when its job's checkpoint
@@ -288,18 +288,17 @@ reached Kafka:
 
 | From the payment reaching Kafka to | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| the Neo4j lookup's reply, for a credit | 185 ms | 520 ms | 544 ms |
-| the decision reaching Kafka | 56 ms | 531 ms | 551 ms |
-| the inbound log's row committing in PostgreSQL | 936 ms | 1,540 ms | 1,589 ms |
+| the Neo4j lookup's reply, for a credit | 27 ms | 388 ms | 446 ms |
+| the decision reaching Kafka | 29 ms | 385 ms | 455 ms |
+| the inbound log's row committing in PostgreSQL | 849 ms | 1,885 ms | 2,018 ms |
 
 Those are the decisions on the first half of the payments in the same run,
 sent one every 20 ms beside the transactions and the transfers while nothing
-was failing. That half took 1.3 seconds to send, and most of its credits
-landed in the first second, while the lookups were starting: that is the
-tail, and here the median too. The last four credits of the half were decided
-and published in 21 to 39 ms. Payments out need no lookup: the fifteen onward
-holds, which the decision row counts too, were published in 14 to 41 ms from
-the first.
+was failing. That half took 1.5 seconds to send. The tail is its first
+credits, which landed while the lookups were starting. From the 21st payment
+on, every credit was decided and published in 21 to 71 ms. Payments out need
+no lookup: the fifteen onward holds, which the decision row counts too, were
+published in 13 to 49 ms from the first.
 
 ## Judging a transfer against the payer's history
 
@@ -362,16 +361,17 @@ the decision, and times every decision as the other checks do:
 
 | From the transfer reaching Kafka to | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| the Neo4j lookup's reply | 195 ms | 513 ms | 540 ms |
-| the decision reaching Kafka | 228 ms | 519 ms | 549 ms |
-| the profile log's row committing in PostgreSQL | 880 ms | 1,534 ms | 2,077 ms |
+| the Neo4j lookup's reply | 23 ms | 350 ms | 459 ms |
+| the decision reaching Kafka | 31 ms | 356 ms | 478 ms |
+| the profile log's row committing in PostgreSQL | 958 ms | 1,886 ms | 2,040 ms |
 
 Those are the first 66 transfers in the same run, the start of the four
 weeks, sent one every 20 ms beside the transactions and the payments while
-nothing was failing. They took 1.6 seconds to send, so the start described
-above covers most of them, the median included. From the 54th transfer on,
-every decision was published in 16 to 44 ms, about what the decision path
-takes: the three windows add little to a decision.
+nothing was failing. They took 1.7 seconds to send. The first of them waited
+for the start described above, and the job caught up as quickly as the
+decision path: from the 36th transfer on, every decision was published in 13
+to 50 ms, about what the decision path takes, so the three windows add little
+to a decision.
 
 ## What a run checks
 
@@ -387,11 +387,11 @@ same for every decision, computing each from the event streams alone:
 | alerts | the 54 alerts the demo's data implies, 4 rings and 50 shared identities, each once | 54, none twice |
 | The case store | one row per alert | 54 |
 | The alert graph | one Alert node per alert, linked to what raised it and to its evidence | 54 |
-| decisions | a decision for every transfer, each the one the demo's data implies, computed without the graph, and every copy of it the same | all 300 right, and 40 published again after the restore and the resend, each the same |
+| decisions | a decision for every transfer, each the one the demo's data implies, computed without the graph, and every copy of it the same | all 300 right, and 39 published again after the restore and the resend, each the same |
 | The decision log | one row per transfer, each as expected | 300, one per transfer |
-| inbound-decisions | a decision for every credit and every onward payment that passes a credit straight through, each the one the payments imply, computed without the graph, every copy of it the same, and nothing else | all 80 right, and 8 published again after the restore, each the same |
+| inbound-decisions | a decision for every credit and every onward payment that passes a credit straight through, each the one the payments imply, computed without the graph, every copy of it the same, and nothing else | all 80 right, and 9 published again after the restore, each the same |
 | The inbound log | one row per inbound decision, each as expected | 80, one per decision |
-| profile-decisions | a decision for every transfer out, each the one the transfers imply, computed without the graph, with the profile it was made from, every copy the same, and nothing else | all 133 right, each with the profile it was made from, and 2 published again after the restore, each the same |
+| profile-decisions | a decision for every transfer out, each the one the transfers imply, computed without the graph, with the profile it was made from, every copy the same, and nothing else | all 133 right, each with the profile it was made from, and 12 published again after the restore, each the same |
 | The profile log | one row per transfer out, each as expected | 133, one per transfer |
 
 In that run a Worker was killed with SIGKILL while the second half of the
