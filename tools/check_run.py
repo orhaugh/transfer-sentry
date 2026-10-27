@@ -77,6 +77,10 @@ def expected_alerts(events, reference):
         out[f"identity:{cid}"] = {"kind": "shared_identity", "severity": severity,
                                   "at": cts[cid], "subject": cid,
                                   "evidence": i["evidence_customers"]}
+    for tid, t in reference["high_risk_traces"].items():
+        severity = "high" if t["origin_high_risk"] or t["flagged_on_chain"] > 0 else "medium"
+        out[f"trace:{tid}"] = {"kind": "high_risk_trace", "severity": severity, "at": ts[tid],
+                               "subject": tid, "evidence": t["evidence"]}
     return out
 
 

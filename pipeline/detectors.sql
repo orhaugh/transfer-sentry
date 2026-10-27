@@ -144,15 +144,106 @@ CREATE TABLE identity_context (
                                s + CASE WHEN s = "" THEN "" ELSE "," END + o.customerID) AS evidence_customers'
 );
 
+-- Does this payment take money into a high-risk jurisdiction that reached
+-- the payer through other accounts first? The demo's "High Risk Accounts"
+-- query (see NOTICE), anchored on a payment into an account in a high-risk
+-- jurisdiction: what the payer has paid that account since the page's start
+-- date, 22 August 2024, traced back through distinct accounts between which
+-- 90% to 110% of it moved, to an account no one paid as much. Only transfers
+-- up to this payment count (by date, then id), so money that reached an
+-- account after it paid is not followed, and the same payment finds the same
+-- trace whenever it is read. One row when the trace has at least one hop
+-- (the longest, then the lowest by account numbers, and how many there
+-- are), none otherwise. The evidence is every transfer the trace counted,
+-- hop by hop, then the payer's earlier payments to the same account.
+CREATE TABLE trace_context (
+    transaction_id    VARCHAR,
+    hops              BIGINT,
+    traces            BIGINT,
+    origin_account    VARCHAR,
+    high_risk_account VARCHAR,
+    trace_accounts    VARCHAR,
+    origin_high_risk  BOOLEAN,
+    flagged_on_chain  BIGINT,
+    evidence          VARCHAR,
+    observed_at       TIMESTAMP(3)
+) WITH (
+    connector          = 'lookup',
+    function           = 'neo4j',
+    endpoint           = 'http://neo4j:7474',
+    username           = 'neo4j',
+    password           = 'env://NEO4J_PASSWORD',
+    request_timeout_ms = '10000',
+    server_timeout_s   = '5',
+    observed_at_column = 'observed_at',
+    statement = 'MATCH (l:Account)-[:SENT]->(x:Transaction {transactionID: $key})-[:RECEIVED]->(h:HighRiskJurisdiction)
+                 WITH l, h, x, datetime("2024-08-22") AS since
+                 WHERE x.date >= since
+                 WITH l, h, x, since, COLLECT {
+                        MATCH (l)-[:SENT]->(p:Transaction)-[:RECEIVED]->(h)
+                        WHERE p.date >= since
+                          AND (p.date < x.date OR (p.date = x.date AND p.transactionID <= x.transactionID))
+                        RETURN p ORDER BY p.date, p.transactionID
+                      } AS paid
+                 WITH l, h, x, since, paid, reduce(acc = 0.0, p IN paid | acc + p.amount) AS total
+                 MATCH (first:Account)
+                       ((a1:Account)-[:SENT]->(t:Transaction)-[:RECEIVED]->(a2:Account)
+                         WHERE t.date >= since
+                           AND (t.date < x.date OR (t.date = x.date AND t.transactionID <= x.transactionID))
+                           AND 0.9 * total <= COLLECT {
+                                 MATCH (a1)-[:SENT]->(m:Transaction)-[:RECEIVED]->(a2)
+                                 WHERE m.date >= since
+                                   AND (m.date < x.date OR (m.date = x.date AND m.transactionID <= x.transactionID))
+                                 RETURN sum(m.amount)
+                               }[0] <= 1.1 * total)+
+                       (l)
+                 WHERE COUNT { WITH first, a2 UNWIND [first] + a2 AS b RETURN DISTINCT b } = size([first] + a2)
+                   AND NOT EXISTS {
+                         MATCH (b:Account)-[:SENT]->(m:Transaction)-[:RECEIVED]->(first)
+                         WHERE m.date >= since
+                           AND (m.date < x.date OR (m.date = x.date AND m.transactionID <= x.transactionID))
+                         WITH b, sum(m.amount) AS moved
+                         WHERE 0.9 * total <= moved <= 1.1 * total
+                       }
+                 WITH DISTINCT h, x, since, paid, [first] + a2 AS chain
+                 ORDER BY size(chain) DESC, [a IN chain | a.accountNumber]
+                 WITH h, x, since, paid, collect(chain) AS chains
+                 WITH h, x, since, paid, chains[0] AS chain, size(chains) AS traces
+                 RETURN size(chain) - 1 AS hops,
+                        traces,
+                        chain[0].accountNumber AS origin_account,
+                        h.accountNumber AS high_risk_account,
+                        reduce(out = "", a IN chain |
+                               out + CASE WHEN out = "" THEN "" ELSE "," END + a.accountNumber) AS trace_accounts,
+                        coalesce(chain[0].highRiskJurisdiction, false) AS origin_high_risk,
+                        size([a IN chain WHERE EXISTS {
+                                MATCH (c:Customer)-[:HAS_ACCOUNT]->(a) WHERE c.fraudFlag }]) AS flagged_on_chain,
+                        reduce(out = "", tid IN COLLECT {
+                                 UNWIND range(0, size(chain) - 2) AS i
+                                 WITH chain[i] AS a1, chain[i + 1] AS a2, i, since, x
+                                 MATCH (a1)-[:SENT]->(m:Transaction)-[:RECEIVED]->(a2)
+                                 WHERE m.date >= since
+                                   AND (m.date < x.date OR (m.date = x.date AND m.transactionID <= x.transactionID))
+                                 RETURN m.transactionID ORDER BY i, m.date, m.transactionID
+                               } + [p IN paid WHERE p <> x | p.transactionID] |
+                               out + CASE WHEN out = "" THEN "" ELSE "," END + tid) AS evidence'
+);
+
 -- What the detectors found, exactly once. Each alert is keyed by the event
--- that raised it (ring:<transaction id>, identity:<customer id>), so whatever
--- stores it downstream can tell a second copy from a second alert.
---   kind      transaction_ring or shared_identity
+-- that raised it (ring:<transaction id>, identity:<customer id>,
+-- trace:<transaction id>), so whatever stores it downstream can tell a
+-- second copy from a second alert.
+--   kind      transaction_ring, shared_identity or high_risk_trace
 --   severity  high for a ring, or for a customer sharing identifiers with one
 --             the bank flags as fraud; medium for a shared email address or
---             phone number; low for a shared street address alone
---   subject   the transaction that closed the ring, or the new customer
---   evidence  the ring's transactions in order, or the earlier customers
+--             phone number; low for a shared street address alone. A trace is
+--             high when the money started in a high-risk jurisdiction or
+--             passed through an account of a customer the bank flags as
+--             fraud, medium otherwise
+--   subject   the transaction that closed the ring, the new customer, or the
+--             payment into the high-risk jurisdiction
+--   evidence  the ring's transactions in order, the earlier customers, or
+--             the transfers the trace counted
 CREATE TABLE alerts (
     alert_id    VARCHAR,
     kind        VARCHAR,
@@ -198,4 +289,16 @@ SELECT 'identity:' || c.customer_id,
          ' earlier customers, ' || CAST(i.shared_with_fraud AS VARCHAR) || ' flagged as fraud',
        i.observed_at
 FROM onboardings c
-JOIN identity_context i ON c.customer_id = i.customer_id;
+JOIN identity_context i ON c.customer_id = i.customer_id
+UNION ALL
+SELECT 'trace:' || t.transaction_id,
+       'high_risk_trace',
+       CASE WHEN h.origin_high_risk OR h.flagged_on_chain > 0 THEN 'high' ELSE 'medium' END,
+       t.ts,
+       t.transaction_id,
+       h.evidence,
+       'pays high-risk account ' || h.high_risk_account || ' what came from ' ||
+         h.origin_account || ': ' || h.trace_accounts,
+       h.observed_at
+FROM transactions t
+JOIN trace_context h ON t.transaction_id = h.transaction_id;

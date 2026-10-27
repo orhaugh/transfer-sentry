@@ -49,8 +49,9 @@ CREATE TABLE cases (
 );
 
 -- An alert node, linked to what raised it (the transaction that closed the
--- ring, or the new customer) and to its evidence (the ring's transactions,
--- or the earlier customers). Created with its relationships in one
+-- ring, the new customer, or the payment into a high-risk jurisdiction) and
+-- to its evidence (the ring's transactions, the earlier customers, or the
+-- transfers the trace counted). Created with its relationships in one
 -- transaction, once, as the keeper creates transactions.
 CREATE TABLE alert_graph (
     alert_id VARCHAR,
@@ -76,7 +77,7 @@ CREATE TABLE alert_graph (
                                  al.summary = row.summary, al._created = true
                  WITH al, row
                  CALL (al, row) {
-                   WITH al, row WHERE al._created AND row.kind = "transaction_ring"
+                   WITH al, row WHERE al._created AND row.kind IN ["transaction_ring", "high_risk_trace"]
                    MATCH (t:Transaction {transactionID: row.subject})
                    CREATE (al)-[:RAISED_ON]->(t)
                    WITH al, row

@@ -290,9 +290,11 @@ def check_dashboard(db, queries, reference):
           f"  {'OK' if same else 'DIFFERENT'}")
     ok &= same
 
-    hrj = db.run(queries["High Risk Accounts"])
-    print(f"  High Risk Accounts: {len(hrj)} rows: "
-          f"{sorted(set(r['l.accountNumber'] for r in hrj))}")
+    hrj = sorted(r["l.accountNumber"] for r in db.run(queries["High Risk Accounts"]))
+    same = hrj == reference["high_risk_accounts"]
+    print(f"  High Risk Accounts: {len(hrj)} rows for {len(set(hrj))} accounts, reference "
+          f"{len(reference['high_risk_accounts'])}  {'OK' if same else 'DIFFERENT'}")
+    ok &= same
     return ok
 
 
@@ -340,7 +342,9 @@ def check_detectors(db, lookups, events, reference):
     ok = True
     for name, keys, want in (
             ("ring_context", [t["transaction_id"] for t in transactions], expected_rings(reference)),
-            ("identity_context", [c["customer_id"] for c in customers], expected_identity(customers))):
+            ("identity_context", [c["customer_id"] for c in customers], expected_identity(customers)),
+            ("trace_context", [t["transaction_id"] for t in transactions],
+             reference["high_risk_traces"])):
         got = {}
         for k in keys:
             rows = db.run(lookups[name], read=True, key=k)
@@ -360,6 +364,10 @@ def check_detectors(db, lookups, events, reference):
             for k, v in sorted(got.items(), key=lambda kv: kv[1]["entry_account"]):
                 print(f"    {k} closes a ring of {v['ring_size']} entered at {v['entry_account']}: "
                       f"{v['ring_accounts']}")
+        elif name == "trace_context":
+            for k, v in got.items():
+                print(f"    {k} pays high-risk account {v['high_risk_account']} what came from "
+                      f"{v['origin_account']}: {v['trace_accounts']}")
         else:
             flagged = sum(1 for v in got.values() if v["shared_with_fraud"])
             print(f"    {flagged} of them share with a customer the demo flags as fraud")

@@ -19,7 +19,9 @@ The demo answers its questions over a finished database: which accounts sit
 in a ring of transfers, which customers share a phone number. A bank needs the
 same answers about the event in front of it, while it can still act: does this
 transfer close a ring, does this applicant share an identity with a customer
-already flagged, is this payment going to an account in a mule network.
+already flagged, is this payment going to an account in a mule network, did
+the money this payment sends to a high-risk jurisdiction come through other
+accounts first.
 Those are the questions this project asks, of every event, as it arrives.
 
 ## What it shows
@@ -28,10 +30,11 @@ Those are the questions this project asks, of every event, as it arrives.
   pipeline models matches the demo's own export pair for pair, and every
   property value for value, so the demo's dashboard queries run on it
   unchanged and give the demo's answers: the same four rings, the same shared
-  identifiers.
+  identifiers, the same accounts paying high-risk jurisdictions.
 - **Questions asked of one event.** The demo's whole-graph queries, anchored on
   the event that has just arrived: a ring is found by the transfer that closes
-  it, a shared identity by the customer who has just onboarded.
+  it, a shared identity by the customer who has just onboarded, and the trail
+  of money into a high-risk jurisdiction by the payment that ends it.
 - **Reads that never run ahead of the writes.** A detector reads the graph only
   for events the graph is known to hold, without coordinating with the job
   that writes it (see [Why announce](#why-announce)).
@@ -129,7 +132,7 @@ Seven clink jobs, each a SQL file:
 | Inbound screen | payments | inbound-decisions: each credit credited, reviewed or held, and each onward payment that passes a credit straight through held |
 | Profile decisions | transfers | profile-decisions: hold, review or approve for every transfer out, from the payer's and payee's profiles and the payee's place in the graph, with the reasons and the profile |
 
-The detectors ask two questions of the graph, through clink's Neo4j lookup:
+The detectors ask three questions of the graph, through clink's Neo4j lookup:
 
 - **Does this transfer close a ring?** The demo's Rings query: money leaves an
   account and comes back to it through 3 to 16 distinct accounts, each transfer
@@ -142,6 +145,28 @@ The detectors ask two questions of the graph, through clink's Neo4j lookup:
   of them the bank has flagged as fraud. A shared address alone is low
   severity; a shared email address or phone number medium; anything shared
   with a flagged customer high.
+- **Did the money in this payment to a high-risk jurisdiction come through
+  other accounts?** The demo's High Risk Accounts query, asked of a payment
+  into an account in a high-risk jurisdiction: what the payer has paid that
+  account since the page's start date, 22 August 2024, traced back through
+  accounts between which 90% to 110% of it moved, to where the money started.
+  Only transfers up to the payment count, so money that reached an account
+  after it paid is not followed. A trace is high severity when the money
+  started in a high-risk jurisdiction or passed through an account of a
+  customer the bank has flagged, medium otherwise.
+
+On the demo's data the third question finds four traces, three of one hop and
+one of two. Three are high severity, because the money started in a
+high-risk jurisdiction or at an account of a customer the demo flags as
+fraud; one is medium. The demo's page lists 36 accounts, every account that
+paid a high-risk account since its start date. Its query means to trace each
+back to where the money started, but its last condition reads the payment
+the query has already matched instead of a transfer of its own, so every
+path back is a row, however far back it starts: 54 rows, which the checks
+reproduce. The detector stops each trace where the money started. Asked that
+way of the whole year, the page would find eight such chains; the detector
+leaves out the four whose first transfer came after the payment they would
+explain.
 
 ## Why announce
 
@@ -214,24 +239,24 @@ time each record arrived.
 
 | From the transfer reaching Kafka to | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| the Neo4j lookup's reply, the decision's context | 17 ms | 199 ms | 440 ms |
-| the decision reaching Kafka | 23 ms | 214 ms | 479 ms |
-| the decision log's row committing in PostgreSQL | 1,013 ms | 1,865 ms | 2,033 ms |
+| the Neo4j lookup's reply, the decision's context | 22 ms | 403 ms | 623 ms |
+| the decision reaching Kafka | 28 ms | 408 ms | 631 ms |
+| the decision log's row committing in PostgreSQL | 1,536 ms | 2,330 ms | 2,618 ms |
 
 Those are the first 150 transfers of the last run, sent one every 20 ms while
 nothing was failing, on one machine, with Kafka, Neo4j and PostgreSQL in
-Docker and clink on the host. The nineteen slowest decisions were the run's
-first nineteen transfers. Neo4j plans a lookup's statement the first time it
-runs it, and the transfers that arrive meanwhile wait for the plan. The
-decision path, the inbound screen and the profile job start reading together,
-each with a lookup of its own, and the first decisions of each waited about
-half a second. From the 41st transfer on, every decision was on the topic in
-13 to 49 ms.
+Docker and clink on the host. The thirty-five slowest decisions were the
+run's first thirty-five transfers. Neo4j plans a lookup's statement the first
+time it runs it, and the transfers that arrive meanwhile wait for the plan.
+The decision path, the inbound screen and the profile job start reading
+together, each with a lookup of its own, and the first decisions of each
+waited more than half a second. From the 37th transfer on, every decision was
+on the topic in 16 to 84 ms, all but four under 50 ms.
 
-The decision log trails the decision by about a second. It writes each row
-exactly once, in a transaction that commits when its job's checkpoint
-completes, every two seconds here. The decision is the topic; the log is the
-record of it.
+The decision log trails the decision by about a second and a half. It writes
+each row exactly once, in a transaction that commits when its job's
+checkpoint completes, every two seconds here. The decision is the topic; the
+log is the record of it.
 
 The context read is timed on clink's clock and the other stages on the
 broker's and PostgreSQL's, which run in Docker and can differ from the host's
@@ -288,17 +313,18 @@ reached Kafka:
 
 | From the payment reaching Kafka to | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| the Neo4j lookup's reply, for a credit | 27 ms | 388 ms | 446 ms |
-| the decision reaching Kafka | 29 ms | 385 ms | 455 ms |
-| the inbound log's row committing in PostgreSQL | 849 ms | 1,885 ms | 2,018 ms |
+| the Neo4j lookup's reply, for a credit | 90 ms | 529 ms | 580 ms |
+| the decision reaching Kafka | 49 ms | 517 ms | 584 ms |
+| the inbound log's row committing in PostgreSQL | 1,863 ms | 2,530 ms | 2,615 ms |
 
 Those are the decisions on the first half of the payments in the same run,
 sent one every 20 ms beside the transactions and the transfers while nothing
-was failing. That half took 1.5 seconds to send. The tail is its first
-credits, which landed while the lookups were starting. From the 21st payment
-on, every credit was decided and published in 21 to 71 ms. Payments out need
-no lookup: the fifteen onward holds, which the decision row counts too, were
-published in 13 to 49 ms from the first.
+was failing. That half took 1.2 seconds to send. The tail is its first
+credits, which landed while the lookups were starting. From the 36th payment
+on, every credit was decided and published in 18 to 54 ms. Payments out need
+no lookup, so the fifteen onward holds, which the decision row counts too,
+were quick from the first: fourteen were published in 13 to 63 ms, and one in
+138 ms.
 
 ## Judging a transfer against the payer's history
 
@@ -361,17 +387,17 @@ the decision, and times every decision as the other checks do:
 
 | From the transfer reaching Kafka to | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| the Neo4j lookup's reply | 23 ms | 350 ms | 459 ms |
-| the decision reaching Kafka | 31 ms | 356 ms | 478 ms |
-| the profile log's row committing in PostgreSQL | 958 ms | 1,886 ms | 2,040 ms |
+| the Neo4j lookup's reply | 53 ms | 485 ms | 571 ms |
+| the decision reaching Kafka | 73 ms | 494 ms | 580 ms |
+| the profile log's row committing in PostgreSQL | 1,910 ms | 2,508 ms | 2,616 ms |
 
 Those are the first 66 transfers in the same run, the start of the four
 weeks, sent one every 20 ms beside the transactions and the payments while
-nothing was failing. They took 1.7 seconds to send. The first of them waited
+nothing was failing. They took 1.4 seconds to send. The first of them waited
 for the start described above, and the job caught up as quickly as the
-decision path: from the 36th transfer on, every decision was published in 13
-to 50 ms, about what the decision path takes, so the three windows add little
-to a decision.
+decision path. From the 33rd transfer on, every decision was published in 19
+to 86 ms, all but six under 50 ms. That is about what the decision path
+takes, so the three windows add little to a decision.
 
 ## What a run checks
 
@@ -382,20 +408,20 @@ same for every decision, computing each from the event streams alone:
 
 | Store | What it must hold | Last run |
 | --- | --- | --- |
-| The graph | every modelled relationship and property as the demo exports them, the same graph as a clean load of the same statements, and the demo's own Rings and shared-identifier answers | identical |
+| The graph | every modelled relationship and property as the demo exports them, the same graph as a clean load of the same statements, and the demo's own Rings, shared-identifier and High Risk Accounts answers | identical |
 | committed-customers, committed-transactions | every onboarding and transaction, read with `read_committed` | all 74 and all 300, and the 20 resent transactions announced again |
-| alerts | the 54 alerts the demo's data implies, 4 rings and 50 shared identities, each once | 54, none twice |
-| The case store | one row per alert | 54 |
-| The alert graph | one Alert node per alert, linked to what raised it and to its evidence | 54 |
-| decisions | a decision for every transfer, each the one the demo's data implies, computed without the graph, and every copy of it the same | all 300 right, and 39 published again after the restore and the resend, each the same |
+| alerts | the 58 alerts the demo's data implies, 4 rings, 50 shared identities and 4 traces into high-risk jurisdictions, each once | 58, none twice |
+| The case store | one row per alert | 58 |
+| The alert graph | one Alert node per alert, linked to what raised it and to its evidence | 58 |
+| decisions | a decision for every transfer, each the one the demo's data implies, computed without the graph, and every copy of it the same | all 300 right, and 38 published again after the restore and the resend, each the same |
 | The decision log | one row per transfer, each as expected | 300, one per transfer |
-| inbound-decisions | a decision for every credit and every onward payment that passes a credit straight through, each the one the payments imply, computed without the graph, every copy of it the same, and nothing else | all 80 right, and 9 published again after the restore, each the same |
+| inbound-decisions | a decision for every credit and every onward payment that passes a credit straight through, each the one the payments imply, computed without the graph, every copy of it the same, and nothing else | all 80 right, and none published twice |
 | The inbound log | one row per inbound decision, each as expected | 80, one per decision |
-| profile-decisions | a decision for every transfer out, each the one the transfers imply, computed without the graph, with the profile it was made from, every copy the same, and nothing else | all 133 right, each with the profile it was made from, and 12 published again after the restore, each the same |
+| profile-decisions | a decision for every transfer out, each the one the transfers imply, computed without the graph, with the profile it was made from, every copy the same, and nothing else | all 133 right, each with the profile it was made from, and 21 published again after the restore, each the same |
 | The profile log | one row per transfer out, each as expected | 133, one per transfer |
 
 In that run a Worker was killed with SIGKILL while the second half of the
-transactions was flowing, with 166 of the 300 in the graph, and every job
+transactions was flowing, with 171 of the 300 in the graph, and every job
 restored from its last completed checkpoint. A producer then resent 20
 transactions, 10 payments and 10 transfers out it had already delivered. The
 keeper writes each resent transaction again, which the graph absorbs and the
@@ -404,13 +430,15 @@ announcements carry, and the detectors read each event once
 decision path decides again the transfers it had read after its checkpoint,
 and the resent ones, the same way, and the decision log holds each once. The
 inbound screens and the profile windows drop the resent payments and
-transfers, so every inbound or profile decision published twice was one the
-restore made again, the same way, and the inbound and profile logs hold each
+transfers, so every profile decision published twice was one the restore
+made again, the same way. The inbound screen had published nothing since its
+last checkpoint, which completed less than 50 ms before the kill, so its
+restore published no decision twice. The inbound and profile logs hold each
 decision once.
 
 ## What it asked of clink
 
-Three capabilities were added to clink for this project:
+Four capabilities were added to clink for this project:
 
 - **A guarantee per sink.** A statement set used to be held to the strongest
   guarantee any of its tables declared, so the keeper, which writes Neo4j at
@@ -424,8 +452,12 @@ Three capabilities were added to clink for this project:
   partitioning, and a window could not read another, so a profile per payer
   and payee could not follow one per payer. A window over a window now reads
   the first one's event-time column, and each row keeps its event time.
+- **A common table expression read twice.** A query could read a CTE only
+  once, so the detectors could not put the transfers they read once through
+  two lookups, one for rings and one for traces. Each reference to a CTE now
+  binds its query again.
 
-All three are on clink's main branch after v0.12.2.
+All four are on clink's main branch after v0.12.2.
 
 ## Running it
 
