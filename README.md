@@ -457,7 +457,7 @@ Four capabilities were added to clink for this project:
   two lookups, one for rings and one for traces. Each reference to a CTE now
   binds its query again.
 
-All four are on clink's main branch after v0.12.2.
+All four are in clink v0.13.0.
 
 ## Running it
 
@@ -465,8 +465,8 @@ All four are on clink's main branch after v0.12.2.
 CLINK_BIN_DIR=/path/to/clink/build ./run.sh
 ```
 
-It needs Docker, Python 3 and a build of clink's main branch (`clink_node`
-and `clink`); clink runs on the host, and reaches the services through their
+It needs Docker, Python 3 and clink 0.13.0 or later (`clink_node` and
+`clink`); clink runs on the host, and reaches the services through their
 host ports.
 
 `run.sh` fetches the demo at a pinned commit (checked against
