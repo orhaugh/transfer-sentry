@@ -469,6 +469,14 @@ It needs Docker, Python 3 and clink 0.13.0 or later (`clink_node` and
 `clink`); clink runs on the host, and reaches the services through their
 host ports.
 
+On Linux x86_64 there is nothing to build: `scripts/get-clink.sh` installs
+clink v0.15.0's prebuilt SDK under `.clink/prefix`, and CI runs the same two
+commands on every push.
+
+```bash
+scripts/get-clink.sh && CLINK_BIN_DIR=.clink/prefix/bin ./run.sh
+```
+
 `run.sh` fetches the demo at a pinned commit (checked against
 `scripts/neo4j-demo.sha256`), turns it into the three event streams and
 writes the payments and the transfers beside them, starts Kafka, Neo4j and
