@@ -1,14 +1,19 @@
 # transfer-sentry CI: run the showcase end to end the way the README does, a
 # Worker kill included. Kafka, Neo4j and PostgreSQL come from
-# docker-compose.yml, clink's own binaries from its prebuilt SDK, and run.sh
-# checks every store, decision and log against the demo's data.
+# docker-compose.yml, and run.sh checks every store, decision and log against
+# the demo's data.
 #
-# clink is pinned to a tagged release (CLINK_VERSION below): get-clink.sh
-# downloads that release's SDK tarball, verifies its checksum and extracts it.
+# clink runs from its own binaries, which get-clink.sh builds from source:
+# clink's prebuilt SDK leaves the broker connectors out, and this showcase
+# reads and writes Kafka. The build is pinned to a tagged release
+# (CLINK_VERSION below) and cached, so only the first run after the pin moves
+# pays for it; the first run on an empty cache also builds clink's pinned
+# Arrow toolchain (~/.clink-deps), which takes the better part of an hour.
+#
 # A dispatch can run it against another clink: clink_version names a release
-# tag, clink_sdk_run a clink release-binaries dry run, whose SDK tarball (and
-# commit) is tested instead. clink's scripts/check-showcases.sh dispatches
-# that for a release candidate before it is tagged.
+# tag, clink_sdk_run a clink release-binaries dry run, whose commit is built
+# instead. clink's scripts/check-showcases.sh dispatches that for a release
+# candidate before it is tagged.
 
 name: ci
 # A dispatched run names the clink it ran against; push and pull request runs
@@ -25,38 +30,81 @@ on:
         description: A clink release tag to run against instead of the pin
         default: ""
       clink_sdk_run:
-        description: A clink release-binaries dry run (its run id) whose SDK to run against
+        description: A clink release-binaries dry run (its run id) whose commit to build and run against
         default: ""
 
 env:
   # The tagged clink release the showcase runs against.
   CLINK_VERSION: ${{ inputs.clink_version || 'v0.15.0' }}
+  # Build the pinned Arrow without the object-store filesystems: nothing here
+  # uses them, and the prebuilt toolchain archive was built against an
+  # aws-sdk the runner does not have.
+  CLINK_ARROW_OBJECT_STORES: "OFF"
+  # clink is C++23; ubuntu-24.04's default gcc-13 lacks the library side.
+  CC: gcc-14
+  CXX: g++-14
 
 jobs:
   run:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch the clink SDK under test
+      # Restored and saved as separate steps, so a run that fails after the
+      # build still keeps it.
+      - name: Restore clink's pinned Arrow toolchain
+        id: deps
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.clink-deps
+          key: clink-deps-${{ runner.os }}-${{ runner.arch }}-obj${{ env.CLINK_ARROW_OBJECT_STORES }}-gcc14-v1
+
+      - name: Restore the pinned clink build
+        id: bin
+        if: ${{ !inputs.clink_sdk_run }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .clink/bin
+          key: clink-bin-${{ env.CLINK_VERSION }}-${{ runner.os }}-${{ runner.arch }}-gcc14-v1
+
+      - name: Tooling, and the client libraries clink's connectors use
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential g++-14 git curl ca-certificates pkg-config \
+            libssl-dev libcurl4-openssl-dev libsqlite3-dev libxml2-dev \
+            libzstd-dev zlib1g-dev libpq-dev librdkafka-dev
+
+      - name: The clink commit under test
         if: inputs.clink_sdk_run
         env:
           GH_TOKEN: ${{ github.token }}
           RUN: ${{ inputs.clink_sdk_run }}
         run: |
-          gh run download "${RUN}" -R orhaugh/clink -n clink-linux-x86_64-ubuntu24.04 -D "${RUNNER_TEMP}/clink-sdk"
-          sdk="$(ls "${RUNNER_TEMP}"/clink-sdk/clink-*.tar.gz)"
           commit="$(gh api "repos/orhaugh/clink/actions/runs/${RUN}" --jq .head_sha)"
-          echo "CLINK_SDK=${sdk}" >> "${GITHUB_ENV}"
           echo "CLINK_COMMIT=${commit}" >> "${GITHUB_ENV}"
-          echo "clink under test: $(basename "${sdk}") from run ${RUN}, commit ${commit}" | tee -a "${GITHUB_STEP_SUMMARY}"
+          echo "clink under test: commit ${commit}, which release-binaries run ${RUN} built" | tee -a "${GITHUB_STEP_SUMMARY}"
 
-      - name: Install clink (the pin, or the clink under test)
+      - name: Build clink (the pin, or the commit under test)
         run: scripts/get-clink.sh
 
+      - name: Save clink's pinned Arrow toolchain
+        if: steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.clink-deps
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+
+      - name: Save the pinned clink build
+        if: ${{ !inputs.clink_sdk_run && steps.bin.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .clink/bin
+          key: ${{ steps.bin.outputs.cache-primary-key }}
+
       - name: The run, a Worker kill included, checked against the demo's data
-        run: CLINK_BIN_DIR="${PWD}/.clink/prefix/bin" CLEANUP=1 ./run.sh
+        run: CLINK_BIN_DIR="${PWD}/.clink/bin" CLEANUP=1 ./run.sh
 
       - name: Keep clink's logs of a failed run
         if: failure()
