@@ -469,7 +469,7 @@ It needs Docker, Python 3 and clink 0.13.0 or later (`clink_node` and
 `clink`); clink runs on the host, and reaches the services through their
 host ports.
 
-`scripts/get-clink.sh` builds the two binaries from clink v0.16.0's source,
+`scripts/get-clink.sh` builds the two binaries from clink v0.16.1's source,
 with the Kafka connector, into `.clink/bin` (clink's prebuilt SDK leaves the
 broker connectors out). The build needs CMake, GCC 14 or Xcode's clang,
 librdkafka and libpq. CI runs the same two commands on every push.
