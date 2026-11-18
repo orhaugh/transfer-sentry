@@ -35,7 +35,7 @@ on:
 
 env:
   # The tagged clink release the showcase runs against.
-  CLINK_VERSION: ${{ inputs.clink_version || 'v0.16.1' }}
+  CLINK_VERSION: ${{ inputs.clink_version || 'v0.16.2' }}
   # Build the pinned Arrow without the object-store filesystems: nothing here
   # uses them, and the prebuilt toolchain archive was built against an
   # aws-sdk the runner does not have.
